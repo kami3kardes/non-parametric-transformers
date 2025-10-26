@@ -85,3 +85,8 @@ def test_per_cv_precompute_and_map(tmp_path):
         loaded = pickle.load(f)
     assert 'cluster_assignments_per_cv' in loaded
     print("per-cv precompute mapping test passed")
+
+if __name__ == "__main__":
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpdir:
+        test_per_cv_precompute_and_map(Path(tmpdir))

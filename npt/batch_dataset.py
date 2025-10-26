@@ -543,7 +543,14 @@ class NPTBatchDataset(torch.utils.data.IterableDataset):
             mode_mask_matrix_str: self.target_loss_matrix[
                 self.row_index:self.row_index + batch_size],
             'cat_features': self.metadata['cat_features'],
-            'num_features': self.metadata['num_features'],
+            # num_features may not be present in older/synthetic metadata.
+            # Fall back to computing it from overall D minus target cols.
+            'num_features': self.metadata.get(
+                'num_features',
+                int(self.metadata.get('D', 0)) -
+                len(self.metadata.get('cat_target_cols', [])) -
+                len(self.metadata.get('num_target_cols', []))
+            ),
             'data_arrs': [
                 col[self.row_index:self.row_index + batch_size]
                 for col in self.data_arrs],
