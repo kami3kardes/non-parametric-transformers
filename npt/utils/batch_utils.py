@@ -2,6 +2,8 @@ import warnings
 from collections import OrderedDict, defaultdict
 
 import numpy as np
+import math
+from typing import Tuple, List, Optional
 from sklearn.utils.multiclass import type_of_target
 from sklearn.utils.validation import column_or_1d
 
@@ -232,3 +234,68 @@ class StratifiedIndexSampler:
             len(set(batch_order_sorted_row_indices)) ==
             len(batch_order_sorted_row_indices))
         return batch_order_sorted_row_indices, batch_sizes
+
+
+class ClusteredIndexSampler:
+    """
+    ClusteredIndexSampler: groups indices by cluster id and returns a new
+    ordering and optional batch_sizes similar to StratifiedIndexSampler.
+
+    API:
+      ClusteredIndexSampler(y, n_splits=1, shuffle=True, random_state=None)
+      get_stratified_test_array(row_index_order) -> (new_row_order, batch_sizes)
+
+    Notes:
+      - y can be either:
+         * an array aligned to row_index_order (len(y) == len(row_index_order)), or
+         * an array indexed by original dataset positions (in which case
+           row_index_order is used to index y).
+      - n_splits controls how many chunks to split the concatenated cluster
+        groups into (used to form coarse batch groups); callers can still
+        slice returned order into fixed-size minibatches.
+    """
+    def __init__(self, y, n_splits: int = 1, shuffle: bool = True, random_state: Optional[int] = None):
+        self.y = np.asarray(y)
+        self.n_splits = max(1, int(n_splits))
+        self.shuffle = bool(shuffle)
+        self.random_state = None if random_state is None else int(random_state)
+        self.rng = np.random.RandomState(self.random_state)
+
+    def get_stratified_test_array(self, row_index_order) -> Tuple[np.ndarray, List[int]]:
+        row_index_order = np.asarray(row_index_order)
+
+        # Align y to row_index_order if needed
+        if len(self.y) != len(row_index_order):
+            if len(self.y) > len(row_index_order) and row_index_order.max() < len(self.y):
+                y_aligned = self.y[row_index_order]
+            else:
+                raise ValueError("ClusteredIndexSampler: y length mismatch with row_index_order")
+        else:
+            y_aligned = self.y
+
+        # Group indices by cluster id (preserving local shuffling)
+        unique_clusters = np.unique(y_aligned)
+        grouped = []
+        for cid in unique_clusters:
+            mask = (y_aligned == cid)
+            ids = row_index_order[mask].copy()
+            if self.shuffle and ids.size > 0:
+                self.rng.shuffle(ids)
+            grouped.append(ids)
+
+        if len(grouped) == 0:
+            return row_index_order.copy(), [len(row_index_order)]
+
+        # Concatenate groups, optionally shuffle group order then split
+        concatenated = np.concatenate(grouped)
+        # Split into n_splits approximately equal chunks
+        chunks = np.array_split(concatenated, self.n_splits)
+        chunks = [c for c in chunks if c.size > 0]
+
+        # Shuffle chunk order to avoid deterministic ordering of clusters across epochs
+        if self.shuffle and len(chunks) > 1:
+            self.rng.shuffle(chunks)
+
+        new_order = np.concatenate(chunks) if len(chunks) > 0 else np.array([], dtype=int)
+        batch_sizes = [int(c.size) for c in chunks]
+        return new_order, batch_sizes
