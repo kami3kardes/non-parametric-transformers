@@ -355,7 +355,13 @@ def mask_data_for_dataset_mode(
     # ****** 2 – FEATURE MASKING *******
     # ##################################
 
-    if c.model_augmentation_bert_mask_prob[dataset_mode] > 0:
+    # tolerate missing config entry by using default 0.0 per mode
+    prob_dict = getattr(c, 'model_augmentation_bert_mask_prob', None)
+    if prob_dict is None:
+        aug_prob = 0.0
+    else:
+        aug_prob = float(prob_dict.get(dataset_mode, 0.0))
+    if aug_prob > 0:
         masked_arrs, augmentation_mask_matrix = (
             apply_mask(
                 data_arrs=masked_arrs,
