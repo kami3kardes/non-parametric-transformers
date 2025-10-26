@@ -328,6 +328,16 @@ def compute_prototypes_for_npt(data_dict, metadata, config):
     for gid, ids in groups.items():
         if len(ids) == 0:
             continue
+
+        # Warning for small groups
+        if len(ids) < n_prototypes_per_group:
+            print(f"\u26A0 Warning: Group {gid} has only {len(ids)} samples but n_prototypes_per_group={n_prototypes_per_group}")
+            print(f"           Will select all {len(ids)} samples as prototypes for this group")
+
+        if len(ids) < k_neighbors:
+            print(f"\u26A0 Warning: Group {gid} has only {len(ids)} samples but k_neighbors={k_neighbors}")
+            print(f"           Neighbors will be limited to {len(ids)} for prototypes in this group")
+
         A = X_scaled[ids]
         # compute pairwise squared distances
         dif = A[:, None, :] - A[None, :, :]
@@ -335,14 +345,22 @@ def compute_prototypes_for_npt(data_dict, metadata, config):
         sumd = d2.sum(axis=1)
         # pick the index(s) of smallest sumd
         order = np.argsort(sumd)
-        chosen = order[:n_prototypes_per_group]
+        chosen = order[:min(n_prototypes_per_group, len(ids))]
+
         for ch in chosen:
             proto_idx = int(ids[int(ch)])
             prototype_indices.append(proto_idx)
-            # compute neighbors for this prototype within full dataset
+
+            # CRITICAL FIX: Find neighbors within the same group
             proto_vec = X_scaled[proto_idx][None, :]
-            all_d2 = np.sum((X_scaled - proto_vec) ** 2, axis=1)
-            nn_idx = np.argsort(all_d2)[:k_neighbors]
+            group_vecs = X_scaled[ids]
+            group_d2 = np.sum((group_vecs - proto_vec) ** 2, axis=1)
+
+            # Get k nearest neighbors within the group (handle small groups)
+            k_actual = min(k_neighbors, len(ids))
+            local_nn_idx = np.argsort(group_d2)[:k_actual]
+            # Map local indices back to global indices
+            nn_idx = ids[local_nn_idx]
             neighbors.append(nn_idx)
 
     data_dict['prototypes'] = {
@@ -352,7 +370,14 @@ def compute_prototypes_for_npt(data_dict, metadata, config):
         'k': k_neighbors
     }
 
-    print(f"Computed {len(prototype_indices)} prototypes (by={prototype_by}), each with k={k_neighbors} neighbors")
+    # Enhanced logging with statistics
+    neighbor_counts = [len(n) for n in neighbors] if len(neighbors) > 0 else [0]
+    group_sizes = [len(ids) for ids in groups.values()] if len(groups) > 0 else [0]
+    print(f"\n\u2714 Computed {len(prototype_indices)} prototypes (by={prototype_by})")
+    print(f"  Total groups: {len(groups)}")
+    print(f"  Neighbors per prototype: min={min(neighbor_counts)}, max={max(neighbor_counts)}, mean={np.mean(neighbor_counts):.1f}")
+    print(f"  Group sizes: min={min(group_sizes)}, max={max(group_sizes)}")
+
     return data_dict
 
 
