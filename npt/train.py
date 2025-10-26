@@ -37,6 +37,31 @@ class Trainer:
         self.torch_dataset = torch_dataset
         self.max_epochs = self.get_max_epochs()
 
+        # If precomputed per-CV cluster assignments exist, inject the correct
+        # assignment array into the dataset's data_dict so downstream batching
+        # (NPTBatchDataset) will pick it up.
+        try:
+            data_dict = getattr(self.dataset, 'data_dict', None)
+            if data_dict is None:
+                data_dict = getattr(self.dataset, 'dataset_dict', None)  # fallback name
+            if data_dict is None and self.c.exp_batch_cluster_per_cv:
+                print("Warning: Trainer could not find dataset.data_dict to inject per-CV clusters.")
+            if (data_dict is not None and
+                    'cluster_assignments_per_cv' in data_dict and
+                    getattr(self.c, 'exp_batch_cluster_per_cv', False)):
+                data_dict['cluster_assignments'] = np.asarray(
+                    data_dict['cluster_assignments_per_cv'][cv_index],
+                    dtype=np.int32)
+            elif data_dict is not None and 'cluster_assignments' in data_dict:
+                # ensure dtype is integer and numpy
+                data_dict['cluster_assignments'] = np.asarray(
+                    data_dict['cluster_assignments'], dtype=np.int32)
+        except Exception:
+            # safe fallback: do nothing if mapping fails
+            pass
+
+        self.max_epochs = self.get_max_epochs()
+
         # Data Loading
         self.data_loader_nprocs = (
             cpu_count() if c.data_loader_nprocs == -1
@@ -549,7 +574,7 @@ class Trainer:
         # or full-batch GD (as further below)
         if (dataset_mode == 'train' and self.c.exp_minibatch_sgd
                 and (not eval_model)):
-            # Standardize and backprop on minibatch loss
+            # Standardize and backpropagate on minibatch loss
             # if minibatch_sgd enabled
             loss_dict = self.loss.finalize_batch_losses()
             train_loss = loss_dict['total_loss']
@@ -645,3 +670,15 @@ class Trainer:
             break_loop = True
 
         return break_loop
+
+    # right before creating the NPTBatchDataset / DataLoader
+    # Ensure cluster assignments are wired for this CV split if present
+    if ('cluster_assignments_per_cv' in data_dict and getattr(c, 'exp_batch_cluster_per_cv', False)):
+        try:
+            data_dict['cluster_assignments'] = np.asarray(
+                data_dict['cluster_assignments_per_cv'][curr_cv_split], dtype=np.int32)
+        except Exception:
+            # fallback: keep global assignments if mapping fails
+            if 'cluster_assignments' in data_dict:
+                data_dict['cluster_assignments'] = np.asarray(
+                    data_dict['cluster_assignments'], dtype=np.int32)

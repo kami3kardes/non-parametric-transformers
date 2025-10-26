@@ -645,6 +645,15 @@ def build_parser():
         type=str,
         help=f'Save attention maps to file. Specify the save path here.')
 
+    # batching / sampling flags
+    parser.add_argument('--exp_batch_cluster_sampling', action='store_true',
+                        help='Enable cluster-based minibatch sampling (requires data_dict["cluster_assignments"])')
+    parser.add_argument('--exp_batch_cluster_mix_prob', type=float, default=1.0,
+                        help='Probability of using cluster-local batches when cluster sampling enabled (0..1)')
+    parser.add_argument('--exp_batch_cluster_per_cv', action='store_true',
+                        dest='exp_batch_cluster_per_cv',
+                        help='If true, use data_dict["cluster_assignments_per_cv"][cv_index] when available')
+
     return parser
 
 

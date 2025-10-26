@@ -276,7 +276,6 @@ class NPTBatchDataset(torch.utils.data.IterableDataset):
             if mode_index in batch_modes:
                 mode_indices.append(arr)
 
-
         # At this point, mode_indices has up to 3 np.arrays (for each of
         # train, val, and test rows).
         # If that is the case, and we are doing stratified batching on the
@@ -322,6 +321,26 @@ class NPTBatchDataset(torch.utils.data.IterableDataset):
         # Concatenate together mode_indices (which index into our matrices)
         mode_indices = np.concatenate(mode_indices)
         n_rows = len(mode_indices)
+
+        # If cluster sampling is enabled, create a ClusteredIndexSampler
+        # that will later be used in batch_gen. Use same n_splits as above.
+        if getattr(self.c, 'exp_batch_cluster_sampling', False) and \
+                'cluster_assignments' in self.data_dict and self.batching_enabled:
+            try:
+                clusters = np.asarray(self.data_dict['cluster_assignments'])
+                # Align clusters to mode_indices
+                clusters_for_mode = clusters[mode_indices]
+                # If we haven't computed n_splits above (len(mode_indices) <=1 or not mode_balance),
+                # derive n_splits from batch_size
+                if 'n_splits' not in locals():
+                    bs = self.c.exp_batch_size
+                    n_splits = int(np.ceil(n_rows / bs)) if bs > 0 else 1
+                stratified_sampler = ClusteredIndexSampler(
+                    y=clusters_for_mode, n_splits=n_splits,
+                    shuffle=True, random_state=self.c.np_seed)
+            except Exception:
+                # silently ignore and keep previously created stratified_sampler
+                pass
 
         return n_rows, batch_modes, mode_indices, stratified_sampler
 
@@ -399,14 +418,59 @@ class NPTBatchDataset(torch.utils.data.IterableDataset):
         _, batch_modes, row_index_order, stratified_sampler = (
             self.dataset_mode_to_batch_settings[self.dataset_mode])
 
-        # Avoid stratifying when we have a super small batch size
-        # TODO Should ideally check against number of classes (in classification)
+        # Stable mapping for dataset_mode -> int (avoid Python hash randomization)
+        mode_to_int = {'train': 0, 'val': 1, 'test': 2}
+        mode_int = mode_to_int.get(self.dataset_mode, 0)
+
+        # If used with DataLoader workers, include worker id to avoid identical RNG
+        worker_info = None
+        try:
+            from torch.utils.data import get_worker_info
+            worker_info = get_worker_info()
+        except Exception:
+            worker_info = None
+        worker_id = worker_info.id if worker_info is not None else 0
+
+        # Set random seed for reproducibility (stable across runs/processes)
+        seed = (int(self.epoch or 0) * 10000 + int(self.curr_cv_split or 0) * 100 +
+                mode_int * 10 + int(worker_id) + int(getattr(self.c, 'np_seed', 0)))
+        rng = np.random.RandomState(seed)
+
+        # Ensure row_index_order is numpy array
+        row_index_order = np.asarray(row_index_order)
+
+        # Decide whether to use the provided sampler (stratified or clustered).
+        # If sampler is a ClusteredIndexSampler and a mix probability is set,
+        # randomly choose between cluster-local sampling and fallback (random/stratified).
+        use_sampler = False
         if stratified_sampler and self.batch_size > 10:
+            # If it's a clustered sampler, honor cluster-mix probability
+            try:
+                from npt.utils.batch_utils import ClusteredIndexSampler as _CIS
+                is_cluster_sampler = isinstance(stratified_sampler, _CIS)
+            except Exception:
+                is_cluster_sampler = False
+
+            if is_cluster_sampler:
+                mix_prob = float(getattr(self.c, 'exp_batch_cluster_mix_prob', 1.0))
+                # clamp
+                mix_prob = min(max(mix_prob, 0.0), 1.0)
+                if rng.rand() < mix_prob:
+                    use_sampler = True
+                else:
+                    use_sampler = False
+            else:
+                use_sampler = True
+
+        if use_sampler:
+            # StratifiedIndexSampler or ClusteredIndexSampler both support
+            # get_stratified_test_array(row_index_order)
             row_index_order, batch_sizes = (
                 stratified_sampler.get_stratified_test_array(row_index_order))
             self.batch_sizes = batch_sizes
         else:
-            np.random.shuffle(row_index_order)
+            # Random shuffle with reproducible RNG
+            rng.shuffle(row_index_order)
             self.batch_sizes = None
 
         # Construct tensor copies with the specified row index order
