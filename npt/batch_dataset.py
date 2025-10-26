@@ -4,7 +4,8 @@ import torch.nn.functional as F
 
 from npt.mask import mask_data_for_dataset_mode
 from npt.utils.batch_utils import (
-    StratifiedIndexSampler, ClusteredIndexSampler, PrototypeIndexSampler)
+    StratifiedIndexSampler, ClusteredIndexSampler, PrototypeIndexSampler,
+    LearnedPrototypeIndexSampler)
 from npt.utils.cv_utils import DATASET_ENUM_TO_MODE
 from npt.utils.encode_utils import torch_cast_to_dtype
 
@@ -122,6 +123,8 @@ class NPTBatchDataset(torch.utils.data.IterableDataset):
         # Handles edge cases of last batches being diff size
         # when we use the StratifiedSampler
         self.batch_sizes = None
+        # Cache for learned prototype sampler
+        self._learned_proto_sampler = None
 
     def prepare_image_dataset(self, data_dict):
         if self.c.data_set not in ['cifar10']:
@@ -224,6 +227,41 @@ class NPTBatchDataset(torch.utils.data.IterableDataset):
         assert mode in self.valid_modes
         self.dataset_mode = mode
         self.epoch = epoch
+        # Update learned prototypes if used
+        if hasattr(self, '_learned_proto_sampler') and \
+                self._learned_proto_sampler is not None:
+            update_freq = int(getattr(self.c, 'exp_prototype_update_period_epochs', 1))
+            should_update = (self.epoch is not None and 
+                           self.epoch % update_freq == 0)
+            if should_update:
+                try:
+                    info = self._learned_proto_sampler.update(epoch=self.epoch)
+                    if self.c.verbose:
+                        print(f"[Epoch {self.epoch}] Updated learned prototypes: "
+                              f"{info['n_prototypes']} prototypes, "
+                              f"diversity={info.get('prototype_diversity', 0):.3f}, "
+                              f"time={info.get('elapsed_time', 0):.2f}s")
+                except Exception as e:
+                    if self.c.verbose:
+                        print(f"Warning: learned prototype sampler update failed: {e}")
+                    # don't raise; sampler may be optional
+        # Recompute batch settings to pick up any runtime changes (e.g. updated
+        # prototypes written into data_dict by an external sampler). This allows
+        # training code to call sampler.update() and then set
+        # data_dict['prototypes'] = sampler.update() between epochs and have
+        # the dataset pick up the new prototype blocks without recreating it.
+        self.dataset_mode_to_batch_settings = {
+            dataset_mode: self.get_batch_indices(dataset_mode=dataset_mode)
+            for dataset_mode in self.valid_modes}
+
+        self.dataset_mode_to_dataset_len = {
+            dataset_mode: self.dataset_mode_to_batch_settings[dataset_mode][0]
+            for dataset_mode in self.valid_modes}
+
+        self.mode_to_n_batches = {
+            dataset_mode: self.get_mode_n_batches(dataset_mode=dataset_mode)
+            for dataset_mode in self.valid_modes}
+
         self.n_batches = self.mode_to_n_batches[mode]
         self.dataset_len = self.dataset_mode_to_dataset_len[mode]
 
@@ -359,6 +397,47 @@ class NPTBatchDataset(torch.utils.data.IterableDataset):
                 # silently ignore and keep previously created stratified_sampler
                 pass
 
+        # Learned prototype sampling: use a trainable prototypes_getter and
+        # an in-memory LearnedPrototypeIndexSampler if enabled. This allows
+        # the training loop to update prototypes periodically and have the
+        # dataset pick up new blocks without being re-instantiated.
+        if getattr(self.c, 'exp_batch_learned_prototype_sampling', False) and \
+                'prototypes_getter' in self.data_dict and \
+                'dataset_features' in self.data_dict and self.batching_enabled:
+            try:
+                prototypes_getter = self.data_dict['prototypes_getter']
+                dataset_features = self.data_dict['dataset_features']
+                k_neighbors = int(getattr(self.c, 'exp_prototype_neighbors', 8))
+                
+                if 'n_splits' not in locals():
+                    bs = self.c.exp_batch_size
+                    n_splits = int(np.ceil(n_rows / bs)) if bs > 0 else 1
+                
+                # Create sampler once and cache it
+                if self._learned_proto_sampler is None:
+                    self._learned_proto_sampler = LearnedPrototypeIndexSampler(
+                        dataset_features=dataset_features,
+                        prototypes_getter=prototypes_getter,
+                        k_neighbors=k_neighbors,
+                        n_splits=n_splits,
+                        shuffle=True,
+                        random_state=self.c.np_seed,
+                        cache_nn_index=True
+                    )
+                    # Initial update
+                    try:
+                        self._learned_proto_sampler.update(epoch=0)
+                    except Exception as e:
+                        if self.c.verbose:
+                            print(f"Warning: initial learned proto sampler update failed: {e}")
+                
+                stratified_sampler = self._learned_proto_sampler
+                
+            except Exception as e:
+                if self.c.verbose:
+                    print(f"Warning: LearnedPrototypeIndexSampler failed: {e}")
+                pass
+
         return n_rows, batch_modes, mode_indices, stratified_sampler
 
     def construct_mode_matrices(self):
@@ -468,8 +547,9 @@ class NPTBatchDataset(torch.utils.data.IterableDataset):
             try:
                 from npt.utils.batch_utils import (
                     ClusteredIndexSampler as _CIS,
-                    PrototypeIndexSampler as _PIS)
-                is_cluster_sampler = isinstance(stratified_sampler, (_CIS, _PIS))
+                    PrototypeIndexSampler as _PIS,
+                    LearnedPrototypeIndexSampler as _LPIS)
+                is_cluster_sampler = isinstance(stratified_sampler, (_CIS, _PIS, _LPIS))
             except Exception:
                 is_cluster_sampler = False
 
