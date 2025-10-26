@@ -157,7 +157,6 @@ if __name__ == "__main__":
         print("SUCCESS")
     else:
         print("FAILED")
-```# filepath: /Users/serdarkamiuckardes/non-parametric-transformers/tests/test_cluster_integration.py
 import sys
 from pathlib import Path
 import numpy as np
