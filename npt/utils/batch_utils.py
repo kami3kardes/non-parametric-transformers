@@ -144,5 +144,66 @@ class ClusteredIndexSampler:
         return new_order, batch_sizes
 
 
+class PrototypeIndexSampler:
+    """
+    PrototypeIndexSampler arranges batches so that each prototype (an actual
+    sample index) is grouped with its nearest neighbors. The sampler returns
+    an ordering and batch sizes similar to other samplers.
+
+    Expected input for y (first arg) is a dict with keys:
+        'prototype_indices': array-like of prototype row indices (into full data)
+        'neighbors': list of arrays, each containing neighbor indices for the
+                     corresponding prototype (may include the prototype itself)
+    """
+    def __init__(self, y, n_splits: int = 1, shuffle: bool = True, random_state: Optional[int] = None):
+        # Normalize inputs
+        if isinstance(y, dict):
+            self.prototype_indices = np.asarray(y.get('prototype_indices', []), dtype=np.int64)
+            self.neighbors = [np.asarray(n, dtype=np.int64) for n in y.get('neighbors', [])]
+        else:
+            # backward compat: if y is array-like, treat as prototype indices with no neighbors
+            self.prototype_indices = np.asarray(y, dtype=np.int64)
+            self.neighbors = [np.array([int(p)]) for p in self.prototype_indices]
+
+        self.n_splits = max(1, int(n_splits))
+        self.shuffle = bool(shuffle)
+        self.random_state = None if random_state is None else int(random_state)
+        self.rng = np.random.RandomState(self.random_state)
+
+    def get_stratified_test_array(self, row_index_order) -> Tuple[np.ndarray, List[int]]:
+        # Build blocks: for each prototype, take prototype followed by its neighbors
+        blocks = []
+        for proto_idx, neigh in zip(self.prototype_indices, self.neighbors):
+            block = np.asarray([proto_idx] + [int(x) for x in neigh if int(x) != int(proto_idx)])
+            blocks.append(block)
+
+        if len(blocks) == 0:
+            return row_index_order.copy(), [len(row_index_order)]
+
+        # Optionally shuffle prototype order
+        if self.shuffle:
+            self.rng.shuffle(blocks)
+
+        concatenated = np.concatenate(blocks)
+
+        # Ensure we only include indices that exist in row_index_order
+        mask = np.isin(concatenated, row_index_order)
+        concatenated = concatenated[mask]
+
+        # Append any remaining row_index_order elements that weren't covered
+        remaining = np.setdiff1d(row_index_order, concatenated, assume_unique=False)
+        if remaining.size > 0:
+            if self.shuffle:
+                self.rng.shuffle(remaining)
+            concatenated = np.concatenate([concatenated, remaining])
+
+        # Split into n_splits chunks
+        chunks = np.array_split(concatenated, self.n_splits)
+        chunks = [c for c in chunks if c.size > 0]
+        new_order = np.concatenate(chunks) if len(chunks) > 0 else np.array([], dtype=int)
+        batch_sizes = [int(c.size) for c in chunks]
+        return new_order, batch_sizes
+
+
 # Export what other modules expect to import
 __all__ = ['StratifiedIndexSampler', 'ClusteredIndexSampler', 'collate_with_pre_batching']
