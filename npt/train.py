@@ -45,7 +45,11 @@ class Trainer:
             if data_dict is None:
                 data_dict = getattr(self.dataset, 'dataset_dict', None)  # fallback name
             if data_dict is None and self.c.exp_batch_cluster_per_cv:
-                print("Warning: Trainer could not find dataset.data_dict to inject per-CV clusters.")
+                # Use Logger if available else print
+                try:
+                    Logger.warn("Trainer could not find dataset.data_dict to inject per-CV clusters.")
+                except Exception:
+                    print("Warning: Trainer could not find dataset.data_dict to inject per-CV clusters.")
             if (data_dict is not None and
                     'cluster_assignments_per_cv' in data_dict and
                     getattr(self.c, 'exp_batch_cluster_per_cv', False)):
@@ -600,7 +604,7 @@ class Trainer:
             if self.tradeoff_annealer is not None:
                 self.tradeoff_annealer.step()
 
-            self.scheduler.step()
+            self scheduler.step()
             self.optimizer.zero_grad()
 
             if print_n and (self.scheduler.num_steps % print_n == 0):
@@ -671,14 +675,4 @@ class Trainer:
 
         return break_loop
 
-    # right before creating the NPTBatchDataset / DataLoader
-    # Ensure cluster assignments are wired for this CV split if present
-    if ('cluster_assignments_per_cv' in data_dict and getattr(c, 'exp_batch_cluster_per_cv', False)):
-        try:
-            data_dict['cluster_assignments'] = np.asarray(
-                data_dict['cluster_assignments_per_cv'][curr_cv_split], dtype=np.int32)
-        except Exception:
-            # fallback: keep global assignments if mapping fails
-            if 'cluster_assignments' in data_dict:
-                data_dict['cluster_assignments'] = np.asarray(
-                    data_dict['cluster_assignments'], dtype=np.int32)
+    # (per-CV cluster assignment wiring is handled in Trainer.__init__)
