@@ -3,7 +3,8 @@ import torch
 import torch.nn.functional as F
 
 from npt.mask import mask_data_for_dataset_mode
-from npt.utils.batch_utils import StratifiedIndexSampler, ClusteredIndexSampler
+from npt.utils.batch_utils import (
+    StratifiedIndexSampler, ClusteredIndexSampler, PrototypeIndexSampler)
 from npt.utils.cv_utils import DATASET_ENUM_TO_MODE
 from npt.utils.encode_utils import torch_cast_to_dtype
 
@@ -342,6 +343,22 @@ class NPTBatchDataset(torch.utils.data.IterableDataset):
                 # silently ignore and keep previously created stratified_sampler
                 pass
 
+        # Prototype sampling: if enabled, create a PrototypeIndexSampler instance
+        # based on precomputed prototypes in data_dict.
+        if getattr(self.c, 'exp_batch_prototype_sampling', False) and \
+                'prototypes' in self.data_dict and self.batching_enabled:
+            try:
+                prot_info = self.data_dict['prototypes']
+                if 'n_splits' not in locals():
+                    bs = self.c.exp_batch_size
+                    n_splits = int(np.ceil(n_rows / bs)) if bs > 0 else 1
+                stratified_sampler = PrototypeIndexSampler(
+                    y=prot_info, n_splits=n_splits,
+                    shuffle=True, random_state=self.c.np_seed)
+            except Exception:
+                # silently ignore and keep previously created stratified_sampler
+                pass
+
         return n_rows, batch_modes, mode_indices, stratified_sampler
 
     def construct_mode_matrices(self):
@@ -449,8 +466,10 @@ class NPTBatchDataset(torch.utils.data.IterableDataset):
         use_sampler = False
         if stratified_sampler and bs > 10:
             try:
-                from npt.utils.batch_utils import ClusteredIndexSampler as _CIS
-                is_cluster_sampler = isinstance(stratified_sampler, _CIS)
+                from npt.utils.batch_utils import (
+                    ClusteredIndexSampler as _CIS,
+                    PrototypeIndexSampler as _PIS)
+                is_cluster_sampler = isinstance(stratified_sampler, (_CIS, _PIS))
             except Exception:
                 is_cluster_sampler = False
 

@@ -218,6 +218,144 @@ def compute_clusters_for_npt(data_dict, metadata, config):
     return data_dict
 
 
+def compute_prototypes_for_npt(data_dict, metadata, config):
+    """
+    Compute prototype (medoid) indices and their nearest neighbors.
+
+    Output written into data_dict['prototypes'] as a dict with keys:
+        'prototype_indices': np.array of indices
+        'neighbors': list of np.arrays with neighbor indices (each the same len)
+        'by': 'cluster' or 'class'
+        'k': number of neighbors
+    """
+    print("\n" + "="*40)
+    print("COMPUTING PROTOTYPES FOR NPT")
+    print("="*40)
+
+    # Extract features (excluding targets) - reuse logic from compute_clusters_for_npt
+    target_cols = set(
+        metadata.get('cat_target_cols', []) +
+        metadata.get('num_target_cols', [])
+    )
+
+    feature_data = []
+    feature_indices = []
+    for col_idx, col in enumerate(data_dict['data_arrs']):
+        if col_idx not in target_cols:
+            if getattr(col, 'ndim', 1) == 2 and col.shape[1] >= 1:
+                vals = col[:, 0]
+            else:
+                vals = col
+            if hasattr(vals, 'cpu'):
+                vals = vals.cpu().numpy()
+            feature_data.append(vals)
+            feature_indices.append(col_idx)
+
+    if len(feature_data) == 0:
+        raise ValueError("No feature columns found for prototype computation!")
+
+    X = np.column_stack(feature_data)
+
+    # Handle missing values similarly
+    missing_matrix = data_dict.get('missing_matrix')
+    if missing_matrix is not None:
+        missing_cols = []
+        for col_idx in feature_indices:
+            if hasattr(missing_matrix, 'cpu'):
+                missing_cols.append(missing_matrix[:, col_idx].cpu().numpy())
+            else:
+                missing_cols.append(missing_matrix[:, col_idx])
+        missing_feature_matrix = np.column_stack(missing_cols)
+        X = np.where(missing_feature_matrix, np.nan, X)
+
+    # Impute
+    from sklearn.impute import SimpleImputer
+    imputer = SimpleImputer(strategy=getattr(config, 'impute_strategy', 'mean'))
+    X_imputed = imputer.fit_transform(X)
+
+    # Standardize if requested
+    if getattr(config, 'standardize', True):
+        from sklearn.preprocessing import StandardScaler
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X_imputed)
+    else:
+        X_scaled = X_imputed
+
+    # Determine grouping: 'cluster' or 'class'
+    prototype_by = getattr(config, 'prototype_by', 'cluster')
+    n_prototypes_per_group = int(getattr(config, 'n_prototypes_per_group', 1))
+    k_neighbors = int(getattr(config, 'prototype_neighbors', 5))
+
+    groups = {}
+    if prototype_by == 'cluster':
+        if 'cluster_assignments' not in data_dict:
+            # Compute clusters first with reasonable defaults
+            print("No cluster_assignments found; computing clusters first (kmeans)...")
+            cfg = type('TmpCfg', (), {})()
+            cfg.cluster_method = getattr(config, 'cluster_method', 'kmeans')
+            cfg.n_clusters = getattr(config, 'n_clusters', 10)
+            cfg.random_state = getattr(config, 'random_state', 0)
+            cfg.min_cluster_size = getattr(config, 'min_cluster_size', 4)
+            cfg.min_samples = getattr(config, 'min_samples', 1)
+            compute_clusters_for_npt(data_dict, metadata, cfg)
+
+        assigns = np.asarray(data_dict['cluster_assignments'])
+        unique = np.unique(assigns)
+        for uid in unique:
+            groups[int(uid)] = np.where(assigns == uid)[0]
+    elif prototype_by == 'class':
+        # Use categorical target first if available
+        cat_targets = metadata.get('cat_target_cols', [])
+        if len(cat_targets) == 0:
+            raise ValueError('prototype_by == class requires categorical target columns')
+        target_col = data_dict['data_arrs'][cat_targets[0]]
+        # target_col may be one-hot; get argmax
+        if hasattr(target_col, 'shape') and target_col.shape[1] > 1:
+            labels = np.argmax(target_col[:, :-1], axis=1)
+        else:
+            labels = target_col[:, 0]
+        labels = np.asarray(labels)
+        unique = np.unique(labels)
+        for uid in unique:
+            groups[int(uid)] = np.where(labels == uid)[0]
+    else:
+        raise ValueError('Unknown prototype_by: ' + str(prototype_by))
+
+    prototype_indices = []
+    neighbors = []
+
+    # For each group, pick medoids (actual samples minimizing sum distances)
+    for gid, ids in groups.items():
+        if len(ids) == 0:
+            continue
+        A = X_scaled[ids]
+        # compute pairwise squared distances
+        dif = A[:, None, :] - A[None, :, :]
+        d2 = np.sum(dif * dif, axis=2)
+        sumd = d2.sum(axis=1)
+        # pick the index(s) of smallest sumd
+        order = np.argsort(sumd)
+        chosen = order[:n_prototypes_per_group]
+        for ch in chosen:
+            proto_idx = int(ids[int(ch)])
+            prototype_indices.append(proto_idx)
+            # compute neighbors for this prototype within full dataset
+            proto_vec = X_scaled[proto_idx][None, :]
+            all_d2 = np.sum((X_scaled - proto_vec) ** 2, axis=1)
+            nn_idx = np.argsort(all_d2)[:k_neighbors]
+            neighbors.append(nn_idx)
+
+    data_dict['prototypes'] = {
+        'prototype_indices': np.asarray(prototype_indices, dtype=np.int32),
+        'neighbors': [np.asarray(n, dtype=np.int32) for n in neighbors],
+        'by': prototype_by,
+        'k': k_neighbors
+    }
+
+    print(f"Computed {len(prototype_indices)} prototypes (by={prototype_by}), each with k={k_neighbors} neighbors")
+    return data_dict
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Precompute cluster assignments for NPT dataset'
