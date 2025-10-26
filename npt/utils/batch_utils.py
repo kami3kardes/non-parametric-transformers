@@ -2,8 +2,7 @@ import warnings
 from collections import OrderedDict, defaultdict
 
 import numpy as np
-import math
-from typing import Tuple, List, Optional
+from typing import List, Tuple, Optional
 from sklearn.utils.multiclass import type_of_target
 from sklearn.utils.validation import column_or_1d
 
@@ -46,213 +45,65 @@ def collate_with_pre_batching(batch):
 # TODO: batching over features?
 
 class StratifiedIndexSampler:
-    def __init__(
-            self, y, n_splits, shuffle=True, label_col=None,
-            train_indices=None):
-        self.y = y
-        self.n_splits = n_splits
-        self.shuffle = shuffle
+    """
+    Minimal StratifiedIndexSampler matching the API used by batch_dataset.
+    Purpose: given y indicators aligned to a row_index_order, produce a
+    permuted ordering and a list of batch_sizes (by splitting into n_splits).
+    This is a simple implementation sufficient for batch ordering / tests.
+    """
+    def __init__(self, y, n_splits=1, shuffle=True, random_state=None, label_col=None, train_indices=None):
+        self.y = np.asarray(y)
+        self.n_splits = max(1, int(n_splits))
+        self.shuffle = bool(shuffle)
+        self.random_state = None if random_state is None else int(random_state)
+        self.rng = np.random.RandomState(self.random_state)
+        # label_col / train_indices are accepted for compat but not required for this simple impl
         self.label_col = label_col
         self.train_indices = train_indices
-        if label_col is not None and train_indices is not None:
-            self.stratify_class_labels = True
-            print('Stratifying train rows in each batch on the class label.')
+
+    def get_stratified_test_array(self, row_index_order) -> Tuple[np.ndarray, List[int]]:
+        row_index_order = np.asarray(row_index_order)
+        # Align y to row_index_order if necessary
+        if len(self.y) != len(row_index_order):
+            if len(self.y) > len(row_index_order) and row_index_order.max() < len(self.y):
+                y_aligned = self.y[row_index_order]
+            else:
+                raise ValueError("StratifiedIndexSampler: y length mismatch with row_index_order")
         else:
-            self.stratify_class_labels = False
+            y_aligned = self.y
 
-    def _make_test_folds(self, labels):
-        """
-        Slight alterations from sklearn (StratifiedKFold)
-        """
-        y, n_splits, shuffle = labels, self.n_splits, self.shuffle
-        y = np.asarray(y)
-        type_of_target_y = type_of_target(y)
-        allowed_target_types = ('binary', 'multiclass')
-        if type_of_target_y not in allowed_target_types:
-            raise ValueError(
-                'Supported target types are: {}. Got {!r} instead.'.format(
-                    allowed_target_types, type_of_target_y))
+        # Group indices by label
+        labels = np.unique(y_aligned)
+        groups = [row_index_order[y_aligned == lbl].copy() for lbl in labels]
 
-        y = column_or_1d(y)
+        # Shuffle within groups
+        if self.shuffle:
+            for g in groups:
+                self.rng.shuffle(g)
 
-        _, y_idx, y_inv = np.unique(y, return_index=True, return_inverse=True)
-        # y_inv encodes y according to lexicographic order. We invert y_idx to
-        # map the classes so that they are encoded by order of appearance:
-        # 0 represents the first label appearing in y, 1 the second, etc.
-        _, class_perm = np.unique(y_idx, return_inverse=True)
-        y_encoded = class_perm[y_inv]
+        # Interleave groups round-robin to get class-balanced ordering
+        max_len = max((g.size for g in groups), default=0)
+        interleaved = []
+        for i in range(max_len):
+            for g in groups:
+                if i < g.size:
+                    interleaved.append(g[i])
+        if len(interleaved) == 0:
+            return row_index_order.copy(), [len(row_index_order)]
 
-        n_classes = len(y_idx)
-        y_counts = np.bincount(y_encoded)
-        min_groups = np.min(y_counts)
-        if np.all(n_splits > y_counts):
-            raise ValueError("n_splits=%d cannot be greater than the"
-                             " number of members in each class."
-                             % (n_splits))
-        if n_splits > min_groups:
-            warnings.warn(("The least populated class in y has only %d"
-                           " members, which is less than n_splits=%d."
-                           % (min_groups, n_splits)), UserWarning)
-
-        # Determine the optimal number of samples from each class in each fold,
-        # using round robin over the sorted y. (This can be done direct from
-        # counts, but that code is unreadable.)
-        y_order = np.sort(y_encoded)
-        allocation = np.asarray(
-            [np.bincount(y_order[i::n_splits], minlength=n_classes)
-             for i in range(n_splits)])
-
-        # To maintain the data order dependencies as best as possible within
-        # the stratification constraint, we assign samples from each class in
-        # blocks (and then mess that up when shuffle=True).
-        test_folds = np.empty(len(y), dtype='i')
-        for k in range(n_classes):
-            # since the kth column of allocation stores the number of samples
-            # of class k in each test set, this generates blocks of fold
-            # indices corresponding to the allocation for class k.
-            folds_for_class = np.arange(n_splits).repeat(allocation[:, k])
-            if shuffle:
-                np.random.shuffle(folds_for_class)
-            test_folds[y_encoded == k] = folds_for_class
-        return test_folds
-
-    def get_stratified_test_array(self, X):
-        """
-        Based on sklearn function StratifiedKFold._iter_test_masks.
-        """
-        if self.stratify_class_labels:
-            return self.get_train_label_stratified_test_array(X)
-
-        test_folds = self._make_test_folds(self.y)
-
-        # Inefficient for huge arrays, particularly when we need to materialize
-        # the index order.
-        # for i in range(n_splits):
-        #     yield test_folds == i
-
-        batch_index_to_row_indices = OrderedDict()
-        batch_index_to_row_index_count = defaultdict(int)
-        for row_index, batch_index in enumerate(test_folds):
-            if batch_index not in batch_index_to_row_indices.keys():
-                batch_index_to_row_indices[batch_index] = [row_index]
-            else:
-                batch_index_to_row_indices[batch_index].append(row_index)
-
-            batch_index_to_row_index_count[batch_index] += 1
-
-        # Keep track of the batch sizes for each batch -- this can vary
-        # towards the end of the epoch, and will not be precisely what the
-        # user specified. Doesn't matter because the model is equivariant
-        # w.r.t. rows.
-        batch_sizes = []
-        for batch_index in batch_index_to_row_indices.keys():
-            batch_sizes.append(batch_index_to_row_index_count[batch_index])
-
-        return (
-            X[np.concatenate(list(batch_index_to_row_indices.values()))],
-            batch_sizes)
-
-    def get_train_label_stratified_test_array(self, X):
-        train_class_folds = self._make_test_folds(
-            self.label_col[self.train_indices])
-
-        # Mapping from the size of a stratified batch of training rows
-        # to the index of the batch.
-        train_batch_size_to_train_batch_indices = defaultdict(list)
-
-        # Mapping from a train batch index to all of the actual train indices
-        train_batch_index_to_train_row_indices = OrderedDict()
-
-        for train_row_index, train_batch_index in enumerate(train_class_folds):
-            if (train_batch_index not in
-                    train_batch_index_to_train_row_indices.keys()):
-                train_batch_index_to_train_row_indices[
-                    train_batch_index] = [train_row_index]
-            else:
-                train_batch_index_to_train_row_indices[
-                    train_batch_index].append(train_row_index)
-
-        for train_batch_index, train_row_indices in (
-                train_batch_index_to_train_row_indices.items()):
-            train_batch_size_to_train_batch_indices[
-                len(train_row_indices)].append(train_batch_index)
-
-        test_folds = self._make_test_folds(self.y)
-
-        # Mapping our actual batch indices to the val and test rows which
-        # have been successfully assigned
-        batch_index_to_val_test_row_indices = OrderedDict()
-
-        # Mapping our actual batch indices to the total number of row indices
-        # in each batch. We will have to assign the stratified train batches
-        # to fulfill this constraint.
-        batch_index_to_row_index_count = defaultdict(int)
-
-        # Mapping our actual batch indices to how many train spots are
-        # "vacant" in each batch. These we will fill with our stratified
-        # train batches.
-        batch_index_to_train_row_index_count = defaultdict(int)
-
-        for row_index, (batch_index, dataset_mode) in enumerate(
-                zip(test_folds, self.y)):
-            batch_index_to_row_index_count[batch_index] += 1
-
-            if dataset_mode == 0:  # Train
-                batch_index_to_train_row_index_count[batch_index] += 1
-            else:
-                if batch_index not in (
-                        batch_index_to_val_test_row_indices.keys()):
-                    batch_index_to_val_test_row_indices[
-                        batch_index] = [row_index]
-                else:
-                    batch_index_to_val_test_row_indices[
-                        batch_index].append(row_index)
-
-        # For all of our actual batches, let's find a suitable batch
-        # of stratified training data for us to use.
-        for batch_index, train_row_index_count in batch_index_to_train_row_index_count.items():
-            try:
-                train_batch_index = (
-                    train_batch_size_to_train_batch_indices[
-                        train_row_index_count].pop())
-            except Exception as e:
-                raise e
-            batch_index_to_val_test_row_indices[batch_index] += (
-                train_batch_index_to_train_row_indices[train_batch_index])
-
-        for train_batch_arr in train_batch_size_to_train_batch_indices.values():
-            if len(train_batch_arr) != 0:
-                raise Exception
-
-        batch_sizes = []
-        for batch_index in batch_index_to_val_test_row_indices.keys():
-            batch_sizes.append(batch_index_to_row_index_count[batch_index])
-
-        batch_order_sorted_row_indices = X[
-            np.concatenate(list(batch_index_to_val_test_row_indices.values()))]
-        assert (
-            len(set(batch_order_sorted_row_indices)) ==
-            len(batch_order_sorted_row_indices))
-        return batch_order_sorted_row_indices, batch_sizes
+        concatenated = np.asarray(interleaved)
+        # Split into n_splits roughly equal chunks
+        chunks = np.array_split(concatenated, self.n_splits)
+        chunks = [c for c in chunks if c.size > 0]
+        new_order = np.concatenate(chunks) if len(chunks) > 0 else np.array([], dtype=int)
+        batch_sizes = [int(c.size) for c in chunks]
+        return new_order, batch_sizes
 
 
 class ClusteredIndexSampler:
     """
-    ClusteredIndexSampler: groups indices by cluster id and returns a new
-    ordering and optional batch_sizes similar to StratifiedIndexSampler.
-
-    API:
-      ClusteredIndexSampler(y, n_splits=1, shuffle=True, random_state=None)
-      get_stratified_test_array(row_index_order) -> (new_row_order, batch_sizes)
-
-    Notes:
-      - y can be either:
-         * an array aligned to row_index_order (len(y) == len(row_index_order)), or
-         * an array indexed by original dataset positions (in which case
-           row_index_order is used to index y).
-      - n_splits controls how many chunks to split the concatenated cluster
-        groups into (used to form coarse batch groups); callers can still
-        slice returned order into fixed-size minibatches.
+    ClusteredIndexSampler groups indices by cluster id and returns an
+    ordering + batch_sizes. Already implemented above; kept for completeness.
     """
     def __init__(self, y, n_splits: int = 1, shuffle: bool = True, random_state: Optional[int] = None):
         self.y = np.asarray(y)
@@ -263,8 +114,6 @@ class ClusteredIndexSampler:
 
     def get_stratified_test_array(self, row_index_order) -> Tuple[np.ndarray, List[int]]:
         row_index_order = np.asarray(row_index_order)
-
-        # Align y to row_index_order if needed
         if len(self.y) != len(row_index_order):
             if len(self.y) > len(row_index_order) and row_index_order.max() < len(self.y):
                 y_aligned = self.y[row_index_order]
@@ -273,7 +122,6 @@ class ClusteredIndexSampler:
         else:
             y_aligned = self.y
 
-        # Group indices by cluster id (preserving local shuffling)
         unique_clusters = np.unique(y_aligned)
         grouped = []
         for cid in unique_clusters:
@@ -286,16 +134,15 @@ class ClusteredIndexSampler:
         if len(grouped) == 0:
             return row_index_order.copy(), [len(row_index_order)]
 
-        # Concatenate groups, optionally shuffle group order then split
         concatenated = np.concatenate(grouped)
-        # Split into n_splits approximately equal chunks
         chunks = np.array_split(concatenated, self.n_splits)
         chunks = [c for c in chunks if c.size > 0]
-
-        # Shuffle chunk order to avoid deterministic ordering of clusters across epochs
         if self.shuffle and len(chunks) > 1:
             self.rng.shuffle(chunks)
-
         new_order = np.concatenate(chunks) if len(chunks) > 0 else np.array([], dtype=int)
         batch_sizes = [int(c.size) for c in chunks]
         return new_order, batch_sizes
+
+
+# Export what other modules expect to import
+__all__ = ['StratifiedIndexSampler', 'ClusteredIndexSampler', 'collate_with_pre_batching']

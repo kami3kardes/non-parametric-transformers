@@ -362,8 +362,14 @@ def main():
         except Exception as e:
             print(f"Visualization failed: {e}")
 
+    # Save updated data_dict
     output_path = args.output_path if args.output_path else args.data_path
     print(f"\nSaving updated data_dict to: {output_path}")
+    # Ensure cluster_assignments dtype
+    if 'cluster_assignments' in data_dict:
+        data_dict['cluster_assignments'] = np.asarray(data_dict['cluster_assignments'], dtype=np.int32)
+    if 'cluster_assignments_per_cv' in data_dict:
+        data_dict['cluster_assignments_per_cv'] = [np.asarray(a, dtype=np.int32) for a in data_dict['cluster_assignments_per_cv']]
     with open(output_path, 'wb') as f:
         pickle.dump(data_dict, f)
 
