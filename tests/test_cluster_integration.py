@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 import numpy as np
 import torch
+import numpy as np
 
 # Ensure repo root on path so imports work when running this test directly
 REPO_ROOT = Path(__file__).resolve().parents[1]
