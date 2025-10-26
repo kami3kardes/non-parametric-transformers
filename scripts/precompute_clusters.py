@@ -314,6 +314,11 @@ def main():
             if 'missing_matrix' in data_dict:
                 mm = data_dict['missing_matrix']
                 temp['missing_matrix'] = (mm[indices] if hasattr(mm, 'shape') else mm)
+            # Slice mask matrices if present (train/val/test masks)
+            for m_key in ['train_mask_matrix', 'val_mask_matrix', 'test_mask_matrix']:
+                if m_key in data_dict:
+                    mat = data_dict[m_key]
+                    temp[m_key] = (mat[indices] if hasattr(mat, 'shape') else mat)
             # Provide minimal metadata for compute_clusters_for_npt
             temp_metadata = dict(metadata)
             temp_metadata['N'] = len(indices)
