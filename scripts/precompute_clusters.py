@@ -129,7 +129,13 @@ def compute_clusters_for_npt(data_dict, metadata, config):
         cluster_assignments = clusterer.fit_predict(X_scaled)
         centers = getattr(clusterer, 'means_', None)
     elif config.cluster_method == 'hdbscan':
-        import hdbscan
+        try:
+            import hdbscan
+        except ImportError:
+            raise ImportError(
+                "hdbscan is required for HDBSCAN clustering but is not installed. "
+                "Install it with: pip install hdbscan"
+            )
         clusterer = hdbscan.HDBSCAN(
             min_cluster_size=config.min_cluster_size,
             min_samples=config.min_samples

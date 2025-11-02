@@ -604,7 +604,7 @@ class Trainer:
             if self.tradeoff_annealer is not None:
                 self.tradeoff_annealer.step()
 
-            self scheduler.step()
+            self.scheduler.step()
             self.optimizer.zero_grad()
 
             if print_n and (self.scheduler.num_steps % print_n == 0):

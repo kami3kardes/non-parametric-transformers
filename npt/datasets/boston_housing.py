@@ -1,7 +1,20 @@
 import numpy as np
-from sklearn.datasets import load_boston
 
 from npt.datasets.base import BaseDataset
+
+# load_boston was removed from sklearn >= 1.2 due to ethical concerns
+# Use alternative data source or fetch from openml
+try:
+    from sklearn.datasets import load_boston
+except ImportError:
+    # Fallback: load from pandas data reader or use fetch_openml
+    from sklearn.datasets import fetch_openml
+    def load_boston(return_X_y=True):
+        """Load Boston Housing dataset from OpenML as a fallback."""
+        data = fetch_openml(name='boston', version=1, as_frame=False, parser='auto')
+        if return_X_y:
+            return data.data, data.target
+        return data
 
 
 class BostonHousingDataset(BaseDataset):
