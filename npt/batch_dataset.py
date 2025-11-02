@@ -69,6 +69,38 @@ class NPTBatchDataset(torch.utils.data.IterableDataset):
         # making views which might be altered downstream).
         self.data_dict = data_dict
 
+        # Compatibility aliases: trainer/scripts may inject *_global keys.
+        # Ensure dataset code can read either form.
+        try:
+            if 'cluster_assignments' not in self.data_dict and 'cluster_assignments_global' in self.data_dict:
+                self.data_dict['cluster_assignments'] = np.asarray(self.data_dict['cluster_assignments_global'], dtype=np.int32)
+            if 'prototypes' not in self.data_dict and 'prototypes_global' in self.data_dict:
+                self.data_dict['prototypes'] = self.data_dict['prototypes_global']
+
+            # Handle per-CV overrides (Trainer may inject per-cv arrays or
+            # precompute script may have saved per-cv data).
+            if 'cluster_assignments_per_cv' in self.data_dict:
+                cv = int(self.curr_cv_split or 0)
+                try:
+                    self.data_dict['cluster_assignments'] = np.asarray(
+                        self.data_dict['cluster_assignments_per_cv'][cv], dtype=np.int32)
+                except Exception:
+                    # fallback: keep global assignments if mapping fails
+                    if 'cluster_assignments' in self.data_dict:
+                        self.data_dict['cluster_assignments'] = np.asarray(self.data_dict['cluster_assignments'], dtype=np.int32)
+
+            if 'prototypes_per_cv' in self.data_dict:
+                cv = int(self.curr_cv_split or 0)
+                try:
+                    self.data_dict['prototypes'] = self.data_dict['prototypes_per_cv'][cv]
+                except Exception:
+                    # fallback: keep global prototypes if mapping fails
+                    pass
+        except Exception:
+            # Be tolerant: do not break dataset creation on minor injection issues.
+            if getattr(self.c, 'verbose', False):
+                print("Warning: failed to apply compatibility aliases / per-CV assignments in data_dict")
+
         # Use model setting information to filter indices
         self.dataset_mode_to_batch_settings = {
             dataset_mode: self.get_batch_indices(dataset_mode=dataset_mode)
@@ -377,9 +409,10 @@ class NPTBatchDataset(torch.utils.data.IterableDataset):
                 stratified_sampler = ClusteredIndexSampler(
                     y=clusters_for_mode, n_splits=n_splits,
                     shuffle=True, random_state=self.c.np_seed)
-            except Exception:
+            except (KeyError, ValueError, TypeError) as e:
                 # silently ignore and keep previously created stratified_sampler
-                pass
+                if self.c.verbose:
+                    print(f"Warning: Could not create ClusteredIndexSampler: {e}")
 
         # Prototype sampling: if enabled, create a PrototypeIndexSampler instance
         # based on precomputed prototypes in data_dict.
@@ -393,9 +426,10 @@ class NPTBatchDataset(torch.utils.data.IterableDataset):
                 stratified_sampler = PrototypeIndexSampler(
                     y=prot_info, n_splits=n_splits,
                     shuffle=True, random_state=self.c.np_seed)
-            except Exception:
+            except (KeyError, ValueError, TypeError) as e:
                 # silently ignore and keep previously created stratified_sampler
-                pass
+                if self.c.verbose:
+                    print(f"Warning: Could not create PrototypeIndexSampler: {e}")
 
         # Learned prototype sampling: use a trainable prototypes_getter and
         # an in-memory LearnedPrototypeIndexSampler if enabled. This allows
@@ -430,13 +464,12 @@ class NPTBatchDataset(torch.utils.data.IterableDataset):
                     except Exception as e:
                         if self.c.verbose:
                             print(f"Warning: initial learned proto sampler update failed: {e}")
-                
+
                 stratified_sampler = self._learned_proto_sampler
-                
-            except Exception as e:
+
+            except (KeyError, ValueError, TypeError, AttributeError) as e:
                 if self.c.verbose:
                     print(f"Warning: LearnedPrototypeIndexSampler failed: {e}")
-                pass
 
         return n_rows, batch_modes, mode_indices, stratified_sampler
 

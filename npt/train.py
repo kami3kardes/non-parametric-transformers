@@ -34,7 +34,16 @@ class Trainer:
         self.wandb_run = wandb_run
         self.is_distributed = False
         self.dataset = dataset
+        if self.dataset is None:
+            raise ValueError("Trainer requires a ColumnEncodingDataset (dataset) instance.")
         self.torch_dataset = torch_dataset
+        self.cv_index = cv_index
+
+        # Inject sampling-related data into dataset.data_dict
+        # This must happen before NPTBatchDataset is created
+        self._inject_cluster_assignments(cv_index)
+        self._inject_static_prototypes(cv_index)
+
         self.max_epochs = self.get_max_epochs()
 
         # If precomputed per-CV cluster assignments exist, inject the correct
@@ -60,9 +69,10 @@ class Trainer:
                 # ensure dtype is integer and numpy
                 data_dict['cluster_assignments'] = np.asarray(
                     data_dict['cluster_assignments'], dtype=np.int32)
-        except Exception:
+        except (KeyError, ValueError, TypeError) as e:
             # safe fallback: do nothing if mapping fails
-            pass
+            if self.c.verbose:
+                print(f"Warning: Could not load cluster assignments: {e}")
 
         self.max_epochs = self.get_max_epochs()
 
@@ -93,10 +103,17 @@ class Trainer:
                 'performing model at the end of training. Please set '
                 'exp_checkpoint_setting to "best_model" to do so.')
 
+        # Prepare arguments for EarlyStopCounter and validate dataset metadata
+        ds_metadata = getattr(self.dataset, 'metadata', None)
+        if ds_metadata is None:
+            raise ValueError("Trainer: dataset.metadata is required for checkpointing/early stopping.")
+        ds_model_cache = getattr(self.dataset, 'model_cache_path', None)
+        ds_n_cv_splits = getattr(self.dataset, 'n_cv_splits', 1)
+
         self.early_stop_counter = EarlyStopCounter(
-            c=c, data_cache_prefix=dataset.model_cache_path,
-            metadata=dataset.metadata, wandb_run=wandb_run, cv_index=cv_index,
-            n_splits=min(dataset.n_cv_splits, c.exp_n_runs),
+            c=c, data_cache_prefix=ds_model_cache,
+            metadata=ds_metadata, wandb_run=wandb_run, cv_index=cv_index,
+            n_splits=min(ds_n_cv_splits, c.exp_n_runs),
             device=self.gpu)
 
         # Initialize from checkpoint, if available
@@ -130,9 +147,125 @@ class Trainer:
         if self.c.exp_eval_every_epoch_or_steps == 'steps':
             self.last_eval = 0
 
+    def _inject_cluster_assignments(self, cv_index):
+        """Inject cluster assignments into data_dict for batch sampling.
+        
+        Supports:
+        - Per-CV cluster assignments (cluster_assignments_per_cv)
+        - Global cluster assignments (cluster_assignments)
+        
+        Args:
+            cv_index: Current cross-validation fold index
+        """
+        try:
+            data_dict = getattr(self.dataset, 'data_dict', None)
+            if data_dict is None:
+                data_dict = getattr(self.dataset, 'dataset_dict', None)
+            
+            if data_dict is None:
+                if getattr(self.c, 'exp_batch_cluster_sampling', False) and self.c.verbose:
+                    print("⚠ Warning: exp_batch_cluster_sampling enabled but no data_dict found")
+                return
+            
+            if not getattr(self.c, 'exp_batch_cluster_sampling', False):
+                return  # Cluster sampling not enabled
+            
+            # Case 1: Per-CV cluster assignments (computed separately for each fold)
+            if ('cluster_assignments_per_cv' in data_dict and 
+                    getattr(self.c, 'exp_batch_cluster_per_cv', False)):
+                cluster_assigns = data_dict['cluster_assignments_per_cv'][cv_index]
+                data_dict['cluster_assignments'] = np.asarray(cluster_assigns, dtype=np.int32)
+                
+                if self.c.verbose:
+                    n_clusters = len(np.unique(cluster_assigns[cluster_assigns >= 0]))
+                    print(f"✓ Loaded per-CV cluster assignments for fold {cv_index}: "
+                          f"{n_clusters} clusters, {len(cluster_assigns)} samples")
+            
+            # Case 2: Global cluster assignments (same for all CV folds)
+            elif 'cluster_assignments' in data_dict:
+                data_dict['cluster_assignments'] = np.asarray(
+                    data_dict['cluster_assignments'], dtype=np.int32)
+                
+                if self.c.verbose:
+                    n_clusters = len(np.unique(data_dict['cluster_assignments']))
+                    print(f"✓ Using global cluster assignments: "
+                          f"{n_clusters} clusters, {len(data_dict['cluster_assignments'])} samples")
+            
+            # Case 3: Clustering enabled but no assignments found
+            else:
+                if self.c.verbose:
+                    print("⚠ Warning: exp_batch_cluster_sampling enabled but no cluster_assignments found!")
+                    print("   Run: python scripts/compute_clusters_for_npt.py --data_path <path>")
+                    print("   Or disable exp_batch_cluster_sampling")
+
+        except Exception as e:
+            if self.c.verbose:
+                print(f"Warning: Failed to load cluster assignments: {e}")
+
+    def _inject_static_prototypes(self, cv_index):
+        """Inject static prototype assignments into data_dict for batch sampling.
+        
+        Supports:
+        - Per-CV prototypes (prototypes_per_cv)
+        - Global prototypes (prototypes)
+        
+        Args:
+            cv_index: Current cross-validation fold index
+        """
+        try:
+            data_dict = getattr(self.dataset, 'data_dict', None)
+            if data_dict is None:
+                data_dict = getattr(self.dataset, 'dataset_dict', None)
+            
+            if data_dict is None:
+                if getattr(self.c, 'exp_batch_prototype_sampling', False) and self.c.verbose:
+                    print("⚠ Warning: exp_batch_prototype_sampling enabled but no data_dict found")
+                return
+            
+            if not getattr(self.c, 'exp_batch_prototype_sampling', False):
+                return  # Static prototype sampling not enabled
+            
+            # Case 1: Per-CV prototype assignments (computed separately for each fold)
+            if ('prototypes_per_cv' in data_dict and 
+                    getattr(self.c, 'exp_batch_prototype_per_cv', False)):
+                proto_info = data_dict['prototypes_per_cv'][cv_index]
+                data_dict['prototypes'] = proto_info
+                
+                if self.c.verbose:
+                    n_prototypes = len(proto_info.get('prototype_indices', []))
+                    k_neighbors = proto_info.get('k', 'unknown')
+                    proto_by = proto_info.get('by', 'unknown')
+                    print(f"✓ Loaded per-CV prototypes for fold {cv_index}: "
+                          f"{n_prototypes} prototypes, k={k_neighbors}, by={proto_by}")
+            
+            # Case 2: Global prototypes (same for all CV folds)
+            elif 'prototypes' in data_dict:
+                if self.c.verbose:
+                    proto_info = data_dict['prototypes']
+                    n_prototypes = len(proto_info.get('prototype_indices', []))
+                    k_neighbors = proto_info.get('k', 'unknown')
+                    proto_by = proto_info.get('by', 'unknown')
+                    print(f"✓ Using global prototypes: "
+                          f"{n_prototypes} prototypes, k={k_neighbors}, by={proto_by}")
+            
+            # Case 3: Prototype sampling enabled but no prototypes found
+            else:
+                if self.c.verbose:
+                    print("⚠ Warning: exp_batch_prototype_sampling enabled but no prototypes found!")
+                    print("   Run: python scripts/compute_prototypes_for_npt.py --data_path <path>")
+                    print("   Or disable exp_batch_prototype_sampling")
+
+        except Exception as e:
+            if self.c.verbose:
+                print(f"Warning: Failed to load prototypes: {e}")
+
     def get_distributed_dataloader(self, epoch):
         if not self.is_distributed:
             raise Exception
+
+        # Ensure the torch_dataset is available for distributed loading
+        if self.torch_dataset is None:
+            raise ValueError("Distributed dataloader requested but torch_dataset is None.")
 
         sampler = torch.utils.data.distributed.DistributedSampler(
             self.torch_dataset,
@@ -347,12 +480,18 @@ class Trainer:
         # Dataset prep -- prepares dataset.batch_gen attribute
         # Relevant in 'production' setting: we want to only input train
         # at train, train/val at val and train/val/test at test.
+        if not hasattr(self.dataset, 'set_mode'):
+            raise ValueError("Dataset object does not implement set_mode(mode, epoch).")
         self.dataset.set_mode(mode=dataset_mode, epoch=epoch)
 
         # Initialize data loaders (serial / distributed, pinned memory)
         if self.is_distributed:
             # TODO: parallel DDP loading?
-            self.torch_dataset.materialize(cv_dataset=self.dataset.cv_dataset)
+            if not hasattr(self.dataset, 'cv_dataset'):
+                raise ValueError("Distributed mode requires dataset.cv_dataset to exist.")
+            # Ensure torch_dataset can materialize from cv_dataset if supported
+            if self.torch_dataset is not None and hasattr(self.torch_dataset, 'materialize'):
+                self.torch_dataset.materialize(cv_dataset=self.dataset.cv_dataset)
             batch_iter, num_batches = self.get_distributed_dataloader(epoch)
         else:
             # TODO: can be beneficial to test > cpu_count() procs if our
@@ -363,6 +502,10 @@ class Trainer:
             if not self.c.data_set_on_cuda:
                 extra_args['pin_memory'] = True
 
+            # Ensure cv_dataset exists
+            if not hasattr(self.dataset, 'cv_dataset'):
+                raise ValueError("Dataset object must expose 'cv_dataset' after set_mode().")
+
             batch_iter = torch.utils.data.DataLoader(
                 dataset=batch_dataset,
                 batch_size=1,  # The dataset is already batched.
@@ -370,8 +513,8 @@ class Trainer:
                 num_workers=self.data_loader_nprocs,
                 collate_fn=collate_with_pre_batching,
                 **extra_args)
-            batch_iter = tqdm(
-                batch_iter, desc='Batch') if self.c.verbose else batch_iter
+
+            batch_iter = tqdm(batch_iter, desc='Batch') if self.c.verbose else batch_iter
 
         if (eval_model and self.c.debug_eval_row_interactions
                 and epoch == 2 and dataset_mode in {'test'}):
@@ -384,17 +527,7 @@ class Trainer:
                     self.c, batch_dict_, dataset_mode,
                     self.scheduler.num_steps)
 
-            # Perform a forward pass for each row (i.e. for a batch with N
-            #   rows, perform N forward passes)
-            # We do this on the second epoch in c.debug_eval_row_interactions
-            # mode -- in the first epoch, we just do normal evaluation.
-            # We also only do this for val and test, because it takes a while.
-            # In each forward pass, we corrupt the other rows in a manner to
-            # test if losing coherent row interactions will hurt performance
-            # - For duplication experiments, we flip the label of the
-            #       duplicate row of the chosen row_index
-            # - For other experiments (e.g., standard datasets), we
-            #       independently permute all other columns
+            # Row-wise evaluation mode (debugging)
             if (eval_model and self.c.debug_eval_row_interactions
                     and epoch == 2 and dataset_mode in {'test'}):
                 n_rows = batch_dict_['data_arrs'][0].shape[0]
@@ -404,28 +537,13 @@ class Trainer:
                     n_rows = n_rows // 2
 
                 if batch_dict_['label_mask_matrix'] is not None:
-                    # Triggers for stochastic label masking.
-                    # Only not None in train mode. In which case this indicates the
-                    # train labels that are masked, and will be evaluated on.
                     label_matrix_key = 'label'
                 else:
-                    # We are in val/test mode of stochastic label masking, or
-                    # are just doing normal train/val/test with no stochastic
-                    # label masking.
-                    # In this case, the dataset_mode_mask_matrix tells us the
-                    # location of all entries where we will compute a loss.
                     label_matrix_key = dataset_mode
 
                 label_matrix = batch_dict_[f'{label_matrix_key}_mask_matrix']
 
                 for row_index in range(n_rows):
-                    # Only consider row_index where we would actually have
-                    # been evaluating a loss.
-
-                    # Note that for protein-duplication:
-                    # we need to add the number of rows in the
-                    # non-duplicated data, to actually have the appropriate
-                    # index for the non-duplicated data.
                     if (self.c.debug_row_interactions and
                             self.c.debug_row_interactions_mode ==
                             'protein-duplicate'):
@@ -435,10 +553,6 @@ class Trainer:
 
                     if label_matrix[original_row_index, :].sum() == 0:
                         continue
-
-                    # This was only used when we were trying out the
-                    # standard row corruption on a duplicated dataset.
-                    # row_index = original_row_index
 
                     modified_batch_dict = debug.corrupt_rows(
                         self.c, batch_dict_, dataset_mode, row_index)
@@ -476,10 +590,8 @@ class Trainer:
             # or to backpropagate if we do full batch GD
             loss_dict = self.loss.finalize_epoch_losses(eval_model)
 
-        # (See docstring) Either perform full-batch GD (as here)
-        # or mini-batch SGD (in run_batch)
+        # Full-batch GD path
         if (not eval_model) and batch_GD:
-            # Backpropagate on the epoch loss
             train_loss = loss_dict['total_loss']
             self.scaler.scale(train_loss).backward()
             self.scaler.step(self.optimizer)
@@ -494,12 +606,6 @@ class Trainer:
         # Reset batch and epoch losses
         self.loss.reset()
 
-        # Always return loss_dict
-        # - If we are doing minibatching, return None to signify we must
-        #       perform another set of mini-batch forward passes over train
-        #       entries to get an eval loss.
-        # - If we are doing full-batch training, we return the loss dict to
-        #       immediately report loss metrics at eval time.
         if (not eval_model) and self.c.exp_minibatch_sgd:
             loss_dict = None
 
@@ -619,7 +725,7 @@ class Trainer:
     def forward_and_loss(
             self, batch_dict, ground_truth_tensors, masked_tensors,
             dataset_mode, eval_model, epoch, label_mask_matrix,
-            augmentation_mask_matrix,):
+            augmentation_mask_matrix):
         """Run forward pass and evaluate model loss."""
         extra_args = {}
 
@@ -636,7 +742,153 @@ class Trainer:
             data_dict=batch_dict, dataset_mode=dataset_mode,
             eval_model=eval_model)
 
+        # Compute main loss using existing Loss API
         self.loss.compute(**loss_kwargs)
+
+        # Compute prototype / IB loss if available and enabled.
+        # Support two integration patterns:
+        #  - model.learned_prototypes.ib_loss(...) (repo pattern)
+        #  - model.ib_loss(...) (alternative pattern)
+        proto_info = {}
+        # Determine configured prototype/ib loss weight (support both naming conventions)
+        proto_weight = float(getattr(self.c, 'exp_prototype_loss_weight',
+                                     getattr(self.c, 'ib_weight', 0.0)))
+
+        if proto_weight > 0.0:
+            try:
+                # Prefer learned_prototypes module if present
+                if hasattr(self.model, 'learned_prototypes') and getattr(self.model, 'learned_prototypes', None) is not None:
+                    # extract features and labels from current batch
+                    batch_features = self._extract_batch_features(masked_tensors, output)
+                    batch_labels = self._extract_batch_labels(batch_dict)
+
+                    ib_loss_val, proto_info = self.model.learned_prototypes.ib_loss(
+                        x=batch_features,
+                        labels=batch_labels,
+                        relevance_weight=getattr(self.c, 'exp_prototype_relevance_weight',
+                                                 getattr(self.c, 'ib_relevance_weight', 1.0)),
+                        redundancy_weight=getattr(self.c, 'exp_prototype_redundancy_weight',
+                                                  getattr(self.c, 'ib_redundancy_weight', 1.0)),
+                        compression_weight=getattr(self.c, 'exp_prototype_compression_weight',
+                                                   getattr(self.c, 'ib_compression_weight', 0.1)),
+                        temperature=getattr(self.c, 'exp_prototype_temperature',
+                                            getattr(self.c, 'ib_temperature', 1.0))
+                    )
+                # Fallback: model exposes ib_loss directly
+                elif hasattr(self.model, 'ib_loss'):
+                    labels = None
+                    try:
+                        labels = self._extract_batch_labels(batch_dict)
+                    except Exception:
+                        labels = batch_dict.get('labels', None)
+                    ib_input = masked_tensors if masked_tensors is not None else ground_truth_tensors
+                    ib_loss_val, proto_info = self.model.ib_loss(
+                        x=ib_input,
+                        labels=labels,
+                        relevance_weight=getattr(self.c, 'exp_prototype_relevance_weight',
+                                                 getattr(self.c, 'ib_relevance_weight', 1.0)),
+                        redundancy_weight=getattr(self.c, 'exp_prototype_redundancy_weight',
+                                                  getattr(self.c, 'ib_redundancy_weight', 1.0)),
+                        compression_weight=getattr(self.c, 'exp_prototype_compression_weight',
+                                                   getattr(self.c, 'ib_compression_weight', 0.1)),
+                        temperature=getattr(self.c, 'exp_prototype_temperature',
+                                            getattr(self.c, 'ib_temperature', 1.0))
+                    )
+                else:
+                    ib_loss_val = None
+                    proto_info = {}
+            except Exception as e:
+                ib_loss_val = None
+                proto_info = {}
+                if self.c.verbose:
+                    print(f"Warning: prototype/IB loss computation failed: {e}")
+
+            if (ib_loss_val is not None):
+                weighted = ib_loss_val * proto_weight
+                # Prefer Loss.add_auxiliary_loss if available
+                if hasattr(self.loss, 'add_auxiliary_loss'):
+                    try:
+                        self.loss.add_auxiliary_loss('prototype_ib', weighted, proto_info)
+                    except (AttributeError, TypeError, RuntimeError) as e:
+                        # fallback to inserting into batch_losses if present
+                        try:
+                            self.loss.batch_losses = getattr(self.loss, 'batch_losses', {})
+                            self.loss.batch_losses['prototype_ib'] = float(weighted.detach().cpu().item()) if isinstance(weighted, torch.Tensor) else float(weighted)
+                        except (AttributeError, TypeError, RuntimeError) as e2:
+                            if self.c.verbose:
+                                print(f"Warning: Could not add prototype_ib loss: {e}, {e2}")
+                else:
+                    # fallback: add numeric entry to loss.batch_losses
+                    try:
+                        self.loss.batch_losses = getattr(self.loss, 'batch_losses', {})
+                        self.loss.batch_losses['prototype_ib'] = float(weighted.detach().cpu().item()) if isinstance(weighted, torch.Tensor) else float(weighted)
+                    except (AttributeError, TypeError, RuntimeError) as e:
+                        if self.c.verbose:
+                            print(f"Warning: Could not add prototype_ib loss to batch_losses: {e}")
+
+        # Return output and proto_info for optional logging by caller
+        return output, proto_info
+
+    def _extract_batch_features(self, masked_tensors, output):
+        """Extract feature representations from model output for prototype learning.
+
+        Args:
+            masked_tensors: Input tensors (list of tensors, one per feature column)
+            output: Model output (list of tensors, one per feature column)
+
+        Returns:
+            torch.Tensor: Feature matrix of shape (batch_size, feature_dim)
+        """
+        # The output is a list of tensors (X_ragged format), one per feature column
+        # We need to concatenate and flatten them to get a feature matrix
+        if output is None or len(output) == 0:
+            # Fallback to using masked_tensors if output is not available
+            tensors_to_use = masked_tensors
+        else:
+            tensors_to_use = output
+
+        # Stack all feature columns and flatten to (batch_size, total_feature_dim)
+        # Each tensor in the list has shape (batch_size, feature_encoding_dim)
+        batch_features = torch.cat([t.view(t.size(0), -1) for t in tensors_to_use], dim=1)
+        return batch_features
+
+    def _extract_batch_labels(self, batch_dict):
+        """Extract labels from batch dictionary for prototype learning.
+
+        Args:
+            batch_dict: Dictionary containing batch data including target columns
+
+        Returns:
+            torch.Tensor: Label tensor of shape (batch_size,) or (batch_size, num_classes)
+        """
+        # Try to get labels from various possible keys in batch_dict
+        if 'labels' in batch_dict:
+            labels = batch_dict['labels']
+        elif 'target_cols' in batch_dict and 'data_arrs' in batch_dict:
+            # Extract labels from target columns in data_arrs
+            target_cols = batch_dict['target_cols']
+            data_arrs = batch_dict['data_arrs']
+            if len(target_cols) > 0:
+                # Use the first target column as labels
+                target_col_idx = target_cols[0]
+                labels = data_arrs[target_col_idx]
+                # If labels are one-hot encoded, convert to class indices
+                if labels.dim() > 1 and labels.size(1) > 1:
+                    labels = torch.argmax(labels, dim=1)
+            else:
+                # No target columns specified, create dummy labels
+                batch_size = data_arrs[0].size(0) if len(data_arrs) > 0 else 0
+                labels = torch.zeros(batch_size, dtype=torch.long, device=data_arrs[0].device)
+        elif 'data_arrs' in batch_dict:
+            # Fallback: use indices as labels (for unsupervised case)
+            batch_size = batch_dict['data_arrs'][0].size(0)
+            device = batch_dict['data_arrs'][0].device
+            labels = torch.arange(batch_size, dtype=torch.long, device=device)
+        else:
+            # Last resort: return None and let caller handle it
+            raise ValueError("Could not extract labels from batch_dict")
+
+        return labels
 
     def eval_check(self, epoch):
         """Check if it's time to evaluate val and test errors."""

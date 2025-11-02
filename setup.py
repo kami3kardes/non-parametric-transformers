@@ -63,8 +63,5 @@ setup(
             "jupyterlab",
             "notebook",
         ],
-        "clustering": [
-            "hdbscan",
-        ],
     },
 )

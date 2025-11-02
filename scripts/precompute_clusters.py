@@ -531,6 +531,21 @@ def main():
         except Exception as e:
             print(f"Visualization failed: {e}")
 
+    # --- Preserve global copies for downstream code that expects *_global keys ---
+    if 'cluster_assignments' in data_dict:
+        # keep a copy under a stable key for consumers that expect a global assignment
+        data_dict['cluster_assignments_global'] = np.asarray(data_dict['cluster_assignments'], dtype=np.int32)
+    if 'prototypes' in data_dict:
+        # copy prototypes dict (ensure prototype indices & neighbors are int32)
+        proto = data_dict['prototypes']
+        proto_copy = dict(proto)
+        if 'prototype_indices' in proto_copy:
+            proto_copy['prototype_indices'] = np.asarray(proto_copy['prototype_indices'], dtype=np.int32)
+        if 'neighbors' in proto_copy:
+            proto_copy['neighbors'] = [np.asarray(n, dtype=np.int32) for n in proto_copy['neighbors']]
+        data_dict['prototypes_global'] = proto_copy
+    # --- end preservation ---
+
     # Save updated data_dict
     output_path = args.output_path if args.output_path else args.data_path
     print(f"\nSaving updated data_dict to: {output_path}")
