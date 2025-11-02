@@ -1,0 +1,67 @@
+"""Setup configuration for Non-Parametric Transformers (NPT)."""
+from setuptools import setup, find_packages
+
+with open("README.md", "r", encoding="utf-8") as fh:
+    long_description = fh.read()
+
+setup(
+    name="non-parametric-transformers",
+    version="0.1.0",
+    author="NPT Authors",
+    description="Self-Attention Between Datapoints: Going Beyond Individual Input-Output Pairs in Deep Learning",
+    long_description=long_description,
+    long_description_content_type="text/markdown",
+    url="https://github.com/OATML/non-parametric-transformers",
+    packages=find_packages(exclude=["tests", "scripts", "experiments"]),
+    classifiers=[
+        "Development Status :: 3 - Alpha",
+        "Intended Audience :: Science/Research",
+        "License :: OSI Approved :: Apache Software License",
+        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.8",
+        "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    ],
+    python_requires=">=3.8",
+    install_requires=[
+        "torch>=1.7.0",
+        "torchvision",
+        "numpy",
+        "pandas",
+        "scikit-learn",
+        "wandb",
+        "dotmap",
+        "tqdm",
+        "pytorch-lightning",
+        "patool",
+        "wget",
+        "scikit-optimize",
+        "xgboost",
+        "catboost",
+        "transformers",
+        "pytorch-tabnet",
+        "numba",
+        "ogb",
+        "memory-profiler",
+        "seaborn",
+        "tensorboardX",
+        "fairseq",
+        "tabnet",
+        "lightgbm",
+        "matplotlib",
+        "qhoptim",
+        "gpytorch",
+    ],
+    extras_require={
+        "dev": [
+            "pytest",
+            "pytest-cov",
+            "pycodestyle",
+            "line-profiler",
+            "jupyterlab",
+            "notebook",
+        ],
+    },
+)

@@ -1,4 +1,5 @@
 """Load model, data and corresponding configs. Trigger training."""
+import ast
 import os
 import pathlib
 import sys
@@ -48,18 +49,22 @@ def setup_args(args):
 
     if not isinstance(args.model_augmentation_bert_mask_prob, dict):
         print('Reading dict for model_augmentation_bert_mask_prob.')
-        # Well, this is ugly. But I blame it on argparse.
-        # There is just no good way to parse dicts as arguments.
-        # Good thing, I don't care about code security.
-        exec(
-            f'args.model_augmentation_bert_mask_prob = '
-            f'{args.model_augmentation_bert_mask_prob}')
+        # Use ast.literal_eval for safe evaluation of dictionary literals
+        try:
+            args.model_augmentation_bert_mask_prob = ast.literal_eval(
+                str(args.model_augmentation_bert_mask_prob))
+        except (ValueError, SyntaxError) as e:
+            raise ValueError(
+                f'Invalid dictionary format for model_augmentation_bert_mask_prob: {e}')
 
     if not isinstance(args.model_label_bert_mask_prob, dict):
-        print('Reading dict for model_augmentation_bert_mask_prob.')
-        exec(
-            f'args.model_label_bert_mask_prob = '
-            f'{args.model_label_bert_mask_prob}')
+        print('Reading dict for model_label_bert_mask_prob.')
+        try:
+            args.model_label_bert_mask_prob = ast.literal_eval(
+                str(args.model_label_bert_mask_prob))
+        except (ValueError, SyntaxError) as e:
+            raise ValueError(
+                f'Invalid dictionary format for model_label_bert_mask_prob: {e}')
 
     if not args.model_bert_augmentation:
         for value in args.model_augmentation_bert_mask_prob.values():
