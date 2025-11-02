@@ -177,10 +177,23 @@ class PrototypeIndexSampler:
 
     def get_stratified_test_array(self, row_index_order) -> Tuple[np.ndarray, List[int]]:
         # Build blocks: for each prototype, take prototype followed by its neighbors
+        # Track seen indices to avoid duplicates
+        seen = set()
         blocks = []
         for proto_idx, neigh in zip(self.prototype_indices, self.neighbors):
-            block = np.asarray([proto_idx] + [int(x) for x in neigh if int(x) != int(proto_idx)])
-            blocks.append(block)
+            block_list = []
+            # Add prototype if not seen
+            if int(proto_idx) not in seen and int(proto_idx) in row_index_order:
+                block_list.append(int(proto_idx))
+                seen.add(int(proto_idx))
+            # Add neighbors if not seen
+            for n in neigh:
+                n_int = int(n)
+                if n_int not in seen and n_int in row_index_order:
+                    block_list.append(n_int)
+                    seen.add(n_int)
+            if block_list:
+                blocks.append(np.asarray(block_list, dtype=np.int64))
 
         if len(blocks) == 0:
             return row_index_order.copy(), [len(row_index_order)]
@@ -189,18 +202,14 @@ class PrototypeIndexSampler:
         if self.shuffle:
             self.rng.shuffle(blocks)
 
-        concatenated = np.concatenate(blocks)
-
-        # Ensure we only include indices that exist in row_index_order
-        mask = np.isin(concatenated, row_index_order)
-        concatenated = concatenated[mask]
+        concatenated = np.concatenate(blocks) if blocks else np.array([], dtype=np.int64)
 
         # Append any remaining row_index_order elements that weren't covered
         remaining = np.setdiff1d(row_index_order, concatenated, assume_unique=False)
         if remaining.size > 0:
             if self.shuffle:
                 self.rng.shuffle(remaining)
-            concatenated = np.concatenate([concatenated, remaining])
+            concatenated = np.concatenate([concatenated, remaining]) if concatenated.size > 0 else remaining
 
         # Split into n_splits chunks
         chunks = np.array_split(concatenated, self.n_splits)
@@ -245,13 +254,16 @@ class LearnedPrototypeIndexSampler:
     def _get_prototypes_array(self):
         """Extract prototypes as numpy array from getter."""
         p = self.prototypes_getter
-        if callable(p):
+
+        # Try to get prototypes attribute first (for nn.Module like LearnedPrototypes)
+        if hasattr(p, 'prototypes'):
+            arr = p.prototypes
+        # Otherwise, if callable, call it
+        elif callable(p):
             arr = p()
         else:
-            arr = getattr(p, 'prototypes', None)
-            if arr is None:
-                raise ValueError('prototypes_getter must be callable or have `.prototypes`')
-        
+            raise ValueError('prototypes_getter must be callable or have `.prototypes` attribute')
+
         if isinstance(arr, np.ndarray):
             out = arr
         elif isinstance(arr, torch.Tensor):
@@ -354,7 +366,7 @@ class LearnedPrototypeIndexSampler:
 
     def get_stratified_test_array(self, row_index_order) -> Tuple[np.ndarray, List[int]]:
         """Build batches from prototype blocks."""
-        
+
         # Warn if never updated
         if self.update_count == 0:
             warnings.warn(
@@ -362,14 +374,27 @@ class LearnedPrototypeIndexSampler:
                 "Blocks may be empty or stale. Call update() before get_stratified_test_array().",
                 UserWarning
             )
-        
+
         row_index_order = np.asarray(row_index_order)
+
+        # Track seen indices to avoid duplicates
+        seen = set()
         blocks = []
-        
+
         for proto_idx, neigh in zip(self.prototype_indices, self.neighbors):
-            # Build block: prototype + neighbors (excluding duplicate)
-            block = np.asarray([int(proto_idx)] + [int(x) for x in neigh if int(x) != int(proto_idx)])
-            blocks.append(block)
+            block_list = []
+            # Add prototype if not seen
+            if int(proto_idx) not in seen and int(proto_idx) in row_index_order:
+                block_list.append(int(proto_idx))
+                seen.add(int(proto_idx))
+            # Add neighbors if not seen
+            for n in neigh:
+                n_int = int(n)
+                if n_int not in seen and n_int in row_index_order:
+                    block_list.append(n_int)
+                    seen.add(n_int)
+            if block_list:
+                blocks.append(np.asarray(block_list, dtype=np.int64))
 
         if len(blocks) == 0:
             return row_index_order.copy(), [len(row_index_order)]
@@ -378,18 +403,14 @@ class LearnedPrototypeIndexSampler:
         if self.shuffle:
             self.rng.shuffle(blocks)
 
-        concatenated = np.concatenate(blocks)
-        
-        # Only include indices that exist in row_index_order
-        mask = np.isin(concatenated, row_index_order)
-        concatenated = concatenated[mask]
-        
+        concatenated = np.concatenate(blocks) if blocks else np.array([], dtype=np.int64)
+
         # Append remaining indices not covered by prototypes
         remaining = np.setdiff1d(row_index_order, concatenated, assume_unique=False)
         if remaining.size > 0:
             if self.shuffle:
                 self.rng.shuffle(remaining)
-            concatenated = np.concatenate([concatenated, remaining])
+            concatenated = np.concatenate([concatenated, remaining]) if concatenated.size > 0 else remaining
 
         # Split into n_splits chunks
         chunks = np.array_split(concatenated, self.n_splits)
