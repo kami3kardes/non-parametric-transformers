@@ -377,9 +377,10 @@ class NPTBatchDataset(torch.utils.data.IterableDataset):
                 stratified_sampler = ClusteredIndexSampler(
                     y=clusters_for_mode, n_splits=n_splits,
                     shuffle=True, random_state=self.c.np_seed)
-            except Exception:
+            except (KeyError, ValueError, TypeError) as e:
                 # silently ignore and keep previously created stratified_sampler
-                pass
+                if self.c.verbose:
+                    print(f"Warning: Could not create ClusteredIndexSampler: {e}")
 
         # Prototype sampling: if enabled, create a PrototypeIndexSampler instance
         # based on precomputed prototypes in data_dict.
@@ -393,9 +394,10 @@ class NPTBatchDataset(torch.utils.data.IterableDataset):
                 stratified_sampler = PrototypeIndexSampler(
                     y=prot_info, n_splits=n_splits,
                     shuffle=True, random_state=self.c.np_seed)
-            except Exception:
+            except (KeyError, ValueError, TypeError) as e:
                 # silently ignore and keep previously created stratified_sampler
-                pass
+                if self.c.verbose:
+                    print(f"Warning: Could not create PrototypeIndexSampler: {e}")
 
         # Learned prototype sampling: use a trainable prototypes_getter and
         # an in-memory LearnedPrototypeIndexSampler if enabled. This allows
@@ -430,13 +432,12 @@ class NPTBatchDataset(torch.utils.data.IterableDataset):
                     except Exception as e:
                         if self.c.verbose:
                             print(f"Warning: initial learned proto sampler update failed: {e}")
-                
+
                 stratified_sampler = self._learned_proto_sampler
-                
-            except Exception as e:
+
+            except (KeyError, ValueError, TypeError, AttributeError) as e:
                 if self.c.verbose:
                     print(f"Warning: LearnedPrototypeIndexSampler failed: {e}")
-                pass
 
         return n_rows, batch_modes, mode_indices, stratified_sampler
 

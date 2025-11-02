@@ -60,9 +60,10 @@ class Trainer:
                 # ensure dtype is integer and numpy
                 data_dict['cluster_assignments'] = np.asarray(
                     data_dict['cluster_assignments'], dtype=np.int32)
-        except Exception:
+        except (KeyError, ValueError, TypeError) as e:
             # safe fallback: do nothing if mapping fails
-            pass
+            if self.c.verbose:
+                print(f"Warning: Could not load cluster assignments: {e}")
 
         self.max_epochs = self.get_max_epochs()
 
@@ -604,7 +605,7 @@ class Trainer:
             if self.tradeoff_annealer is not None:
                 self.tradeoff_annealer.step()
 
-            self scheduler.step()
+            self.scheduler.step()
             self.optimizer.zero_grad()
 
             if print_n and (self.scheduler.num_steps % print_n == 0):
@@ -619,7 +620,7 @@ class Trainer:
     def forward_and_loss(
             self, batch_dict, ground_truth_tensors, masked_tensors,
             dataset_mode, eval_model, epoch, label_mask_matrix,
-            augmentation_mask_matrix,):
+            augmentation_mask_matrix):
         """Run forward pass and evaluate model loss."""
         extra_args = {}
 
@@ -636,7 +637,153 @@ class Trainer:
             data_dict=batch_dict, dataset_mode=dataset_mode,
             eval_model=eval_model)
 
+        # Compute main loss using existing Loss API
         self.loss.compute(**loss_kwargs)
+
+        # Compute prototype / IB loss if available and enabled.
+        # Support two integration patterns:
+        #  - model.learned_prototypes.ib_loss(...) (repo pattern)
+        #  - model.ib_loss(...) (alternative pattern)
+        proto_info = {}
+        # Determine configured prototype/ib loss weight (support both naming conventions)
+        proto_weight = float(getattr(self.c, 'exp_prototype_loss_weight',
+                                     getattr(self.c, 'ib_weight', 0.0)))
+
+        if proto_weight > 0.0:
+            try:
+                # Prefer learned_prototypes module if present
+                if hasattr(self.model, 'learned_prototypes') and getattr(self.model, 'learned_prototypes', None) is not None:
+                    # extract features and labels from current batch
+                    batch_features = self._extract_batch_features(masked_tensors, output)
+                    batch_labels = self._extract_batch_labels(batch_dict)
+
+                    ib_loss_val, proto_info = self.model.learned_prototypes.ib_loss(
+                        x=batch_features,
+                        labels=batch_labels,
+                        relevance_weight=getattr(self.c, 'exp_prototype_relevance_weight',
+                                                 getattr(self.c, 'ib_relevance_weight', 1.0)),
+                        redundancy_weight=getattr(self.c, 'exp_prototype_redundancy_weight',
+                                                  getattr(self.c, 'ib_redundancy_weight', 1.0)),
+                        compression_weight=getattr(self.c, 'exp_prototype_compression_weight',
+                                                   getattr(self.c, 'ib_compression_weight', 0.1)),
+                        temperature=getattr(self.c, 'exp_prototype_temperature',
+                                            getattr(self.c, 'ib_temperature', 1.0))
+                    )
+                # Fallback: model exposes ib_loss directly
+                elif hasattr(self.model, 'ib_loss'):
+                    labels = None
+                    try:
+                        labels = self._extract_batch_labels(batch_dict)
+                    except Exception:
+                        labels = batch_dict.get('labels', None)
+                    ib_input = masked_tensors if masked_tensors is not None else ground_truth_tensors
+                    ib_loss_val, proto_info = self.model.ib_loss(
+                        x=ib_input,
+                        labels=labels,
+                        relevance_weight=getattr(self.c, 'exp_prototype_relevance_weight',
+                                                 getattr(self.c, 'ib_relevance_weight', 1.0)),
+                        redundancy_weight=getattr(self.c, 'exp_prototype_redundancy_weight',
+                                                  getattr(self.c, 'ib_redundancy_weight', 1.0)),
+                        compression_weight=getattr(self.c, 'exp_prototype_compression_weight',
+                                                   getattr(self.c, 'ib_compression_weight', 0.1)),
+                        temperature=getattr(self.c, 'exp_prototype_temperature',
+                                            getattr(self.c, 'ib_temperature', 1.0))
+                    )
+                else:
+                    ib_loss_val = None
+                    proto_info = {}
+            except Exception as e:
+                ib_loss_val = None
+                proto_info = {}
+                if self.c.verbose:
+                    print(f"Warning: prototype/IB loss computation failed: {e}")
+
+            if (ib_loss_val is not None):
+                weighted = ib_loss_val * proto_weight
+                # Prefer Loss.add_auxiliary_loss if available
+                if hasattr(self.loss, 'add_auxiliary_loss'):
+                    try:
+                        self.loss.add_auxiliary_loss('prototype_ib', weighted, proto_info)
+                    except (AttributeError, TypeError, RuntimeError) as e:
+                        # fallback to inserting into batch_losses if present
+                        try:
+                            self.loss.batch_losses = getattr(self.loss, 'batch_losses', {})
+                            self.loss.batch_losses['prototype_ib'] = float(weighted.detach().cpu().item()) if isinstance(weighted, torch.Tensor) else float(weighted)
+                        except (AttributeError, TypeError, RuntimeError) as e2:
+                            if self.c.verbose:
+                                print(f"Warning: Could not add prototype_ib loss: {e}, {e2}")
+                else:
+                    # fallback: add numeric entry to loss.batch_losses
+                    try:
+                        self.loss.batch_losses = getattr(self.loss, 'batch_losses', {})
+                        self.loss.batch_losses['prototype_ib'] = float(weighted.detach().cpu().item()) if isinstance(weighted, torch.Tensor) else float(weighted)
+                    except (AttributeError, TypeError, RuntimeError) as e:
+                        if self.c.verbose:
+                            print(f"Warning: Could not add prototype_ib loss to batch_losses: {e}")
+
+        # Return output and proto_info for optional logging by caller
+        return output, proto_info
+
+    def _extract_batch_features(self, masked_tensors, output):
+        """Extract feature representations from model output for prototype learning.
+
+        Args:
+            masked_tensors: Input tensors (list of tensors, one per feature column)
+            output: Model output (list of tensors, one per feature column)
+
+        Returns:
+            torch.Tensor: Feature matrix of shape (batch_size, feature_dim)
+        """
+        # The output is a list of tensors (X_ragged format), one per feature column
+        # We need to concatenate and flatten them to get a feature matrix
+        if output is None or len(output) == 0:
+            # Fallback to using masked_tensors if output is not available
+            tensors_to_use = masked_tensors
+        else:
+            tensors_to_use = output
+
+        # Stack all feature columns and flatten to (batch_size, total_feature_dim)
+        # Each tensor in the list has shape (batch_size, feature_encoding_dim)
+        batch_features = torch.cat([t.view(t.size(0), -1) for t in tensors_to_use], dim=1)
+        return batch_features
+
+    def _extract_batch_labels(self, batch_dict):
+        """Extract labels from batch dictionary for prototype learning.
+
+        Args:
+            batch_dict: Dictionary containing batch data including target columns
+
+        Returns:
+            torch.Tensor: Label tensor of shape (batch_size,) or (batch_size, num_classes)
+        """
+        # Try to get labels from various possible keys in batch_dict
+        if 'labels' in batch_dict:
+            labels = batch_dict['labels']
+        elif 'target_cols' in batch_dict and 'data_arrs' in batch_dict:
+            # Extract labels from target columns in data_arrs
+            target_cols = batch_dict['target_cols']
+            data_arrs = batch_dict['data_arrs']
+            if len(target_cols) > 0:
+                # Use the first target column as labels
+                target_col_idx = target_cols[0]
+                labels = data_arrs[target_col_idx]
+                # If labels are one-hot encoded, convert to class indices
+                if labels.dim() > 1 and labels.size(1) > 1:
+                    labels = torch.argmax(labels, dim=1)
+            else:
+                # No target columns specified, create dummy labels
+                batch_size = data_arrs[0].size(0) if len(data_arrs) > 0 else 0
+                labels = torch.zeros(batch_size, dtype=torch.long, device=data_arrs[0].device)
+        elif 'data_arrs' in batch_dict:
+            # Fallback: use indices as labels (for unsupervised case)
+            batch_size = batch_dict['data_arrs'][0].size(0)
+            device = batch_dict['data_arrs'][0].device
+            labels = torch.arange(batch_size, dtype=torch.long, device=device)
+        else:
+            # Last resort: return None and let caller handle it
+            raise ValueError("Could not extract labels from batch_dict")
+
+        return labels
 
     def eval_check(self, epoch):
         """Check if it's time to evaluate val and test errors."""
